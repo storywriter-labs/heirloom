@@ -61,13 +61,20 @@ export default function SessionPage() {
                 }
             })
             .then(transcriptData => {
+                console.log('transcript fetch result:', transcriptData);
                 if (transcriptData) setTranscript(transcriptData);
             })
-            .catch(() => setError('Failed to load session'))
+            .catch(err => {
+                console.log('transcript fetch error:', err);
+                setError('Failed to load session');
+            })
+            // .catch(() => setError('Failed to load session'))
             .finally(() => setLoading(false));
     }, [sessionId, router]);
 
     async function handleSynthesise() {
+        console.log('transcript:', transcript);
+        console.log('format:', format);
         if (!transcript) return;
         setSynthesising(true);
         setError('');
