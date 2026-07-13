@@ -81,10 +81,11 @@ export default function SessionPage() {
 
         try {
             const result = await apiFetch(
-                `/heirloom/v1/transcripts/${transcript.id}/narratives`,
+                // `/heirloom/v1/transcripts/${transcript.id}/narratives`,
+                `/heirloom/v1/subjects/${subjectId}/narratives`,
                 {
                     method: 'POST',
-                    body: JSON.stringify({ format }),
+                    body: JSON.stringify({ format, transcript_id: transcript.id }),
                 }
             );
             setNarrative(result);
