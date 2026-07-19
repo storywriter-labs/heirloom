@@ -1,0 +1,224 @@
+name: Deploy Staging
+
+# Merges to main deploy heirloom-staging.storywriter.net (matching the
+# frontend/backend release scheme). Terraform state is checked on every run:
+# an empty state or drift triggers an apply, an up-to-date state is a no-op.
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+# One deploy at a time: queued runs wait instead of racing a deploy in flight.
+concurrency:
+  group: deploy-heirloom-staging
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '24'
+  AWS_REGION: us-east-1
+  TERRAFORM_DIR: terraform/heirloom-staging
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linting
+        run: npm run lint
+
+  infrastructure:
+    runs-on: ubuntu-latest
+    environment: staging
+    outputs:
+      s3_bucket: ${{ steps.terraform.outputs.s3_bucket_name }}
+      cloudfront_id: ${{ steps.terraform.outputs.cloudfront_distribution_id }}
+      domain: ${{ steps.terraform.outputs.domain_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "~1.0"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform init
+
+      - name: Terraform Plan / Apply
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          EXIT_CODE=0
+          terraform plan -detailed-exitcode -out=tfplan || EXIT_CODE=$?
+
+          case $EXIT_CODE in
+            0)
+              echo "✅ Infrastructure is up to date - no changes needed"
+              ;;
+            2)
+              echo "⚠️  Infrastructure changes detected (first run or drift)"
+              terraform apply -auto-approve tfplan
+              echo "✅ Infrastructure applied"
+              ;;
+            *)
+              echo "❌ Terraform plan failed (exit code $EXIT_CODE)"
+              exit 1
+              ;;
+          esac
+
+      - name: Extract Terraform Outputs
+        id: terraform
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          echo "s3_bucket_name=$(terraform output -raw s3_bucket_name)" >> $GITHUB_OUTPUT
+          echo "cloudfront_distribution_id=$(terraform output -raw cloudfront_distribution_id)" >> $GITHUB_OUTPUT
+          echo "domain_name=$(terraform output -raw domain_name)" >> $GITHUB_OUTPUT
+
+  build:
+    needs: [lint]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build static export
+        env:
+          # Baked in at build time; staging builds always target the staging API
+          NEXT_PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL || 'https://staging-api.storywriter.net/api' }}
+        run: |
+          echo "Building with NEXT_PUBLIC_API_URL: $NEXT_PUBLIC_API_URL"
+          npm run build
+
+      - name: Validate build output
+        run: |
+          for f in out/index.html out/login.html out/dashboard.html out/404.html; do
+            if [ ! -f "$f" ]; then
+              echo "❌ Build failed: $f not found in static export"
+              exit 1
+            fi
+          done
+          echo "✅ Build validation passed"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: heirloom-build-staging
+          path: out/
+          retention-days: 7
+
+  deploy:
+    needs: [infrastructure, build]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: heirloom-build-staging
+          path: out/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create deployment backup
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          BACKUP_KEY="backups/staging/${TIMESTAMP}/"
+
+          echo "Creating backup at s3://${{ needs.infrastructure.outputs.s3_bucket }}/${BACKUP_KEY}"
+          aws s3 sync s3://${{ needs.infrastructure.outputs.s3_bucket }}/ \
+            s3://${{ needs.infrastructure.outputs.s3_bucket }}/${BACKUP_KEY} \
+            --exclude "backups/*" || echo "No existing files to backup"
+
+      - name: Deploy to S3
+        run: |
+          BUCKET=${{ needs.infrastructure.outputs.s3_bucket }}
+          echo "Deploying to s3://${BUCKET}"
+
+          # Hashed/static assets: immutable, long cache. HTML and RSC .txt
+          # payloads are unhashed and change every deploy, so they're synced
+          # separately with no-cache below. backups/ is excluded so --delete
+          # never touches it.
+          aws s3 sync ./out s3://${BUCKET}/ --delete \
+            --exclude "backups/*" --exclude "*.html" --exclude "*.txt" \
+            --cache-control "public, max-age=31536000, immutable"
+
+          aws s3 sync ./out s3://${BUCKET}/ \
+            --exclude "*" --include "*.html" --include "*.txt" \
+            --cache-control "public, max-age=0, must-revalidate"
+
+      - name: Invalidate CloudFront distribution
+        id: invalidate
+        run: |
+          echo "Invalidating CloudFront distribution: ${{ needs.infrastructure.outputs.cloudfront_id }}"
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id ${{ needs.infrastructure.outputs.cloudfront_id }} \
+            --paths "/*" \
+            --query 'Invalidation.Id' \
+            --output text)
+
+          echo "invalidation_id=${INVALIDATION_ID}" >> $GITHUB_OUTPUT
+
+      - name: Wait for CloudFront invalidation
+        run: |
+          aws cloudfront wait invalidation-completed \
+            --distribution-id ${{ needs.infrastructure.outputs.cloudfront_id }} \
+            --id ${{ steps.invalidate.outputs.invalidation_id }}
+          echo "✅ CloudFront invalidation completed"
+
+  verify-deployment:
+    needs: [infrastructure, deploy]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Verify deployment
+        run: |
+          DOMAIN=${{ needs.infrastructure.outputs.domain }}
+          echo "Verifying deployment at https://${DOMAIN}"
+
+          # /login exercises the CloudFront url-rewrite function, not just the root object
+          for path in "/" "/login"; do
+            if curl -f -s -m 10 -o /dev/null "https://${DOMAIN}${path}"; then
+              echo "✅ https://${DOMAIN}${path} is accessible"
+            else
+              echo "❌ https://${DOMAIN}${path} failed"
+              exit 1
+            fi
+          done
