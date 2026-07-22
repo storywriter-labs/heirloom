@@ -48,9 +48,14 @@ after verifying it, rather than doing both in one apply.
 2. **`terraform.tfvars`** (gitignored) — copy `terraform.tfvars.example` and fill
    in the VPC/subnet/zone IDs, `admin_email`, SSH CIDRs, and the deploy public key.
 
-3. **GitHub `staging` environment** must also have the `AWS_ROLE_ARN` OIDC secret
-   (used by the Terraform job) — the same role the static setup used; its trust
-   policy already covers `repo:storywriter-labs/heirloom:*`.
+3. **GitHub `staging` environment** needs two secrets for the deploy workflow:
+   - `SSH_PRIVATE_KEY` — private half of the deploy keypair (see step 1).
+   - `STAGING_HOST` — the instance's public host, e.g.
+     `heirloom-staging.storywriter.net` (or its Elastic IP).
+
+   CI does **not** run Terraform (see below), so no AWS/OIDC secret is required
+   by the workflow — infra is provisioned manually with the credentials you run
+   `terraform` with locally.
 
 ## Provisioning
 
@@ -80,10 +85,11 @@ Notes:
 ## Deploying the app
 
 The normal path is CI: `.github/workflows/deploy-staging.yml` runs on every merge
-to `main` (lint → terraform plan/apply → build standalone → scp to the instance →
-flip `current` symlink → `systemctl restart` → verify). It authenticates to AWS
-via OIDC (`AWS_ROLE_ARN`) for the Terraform job and over SSH (`SSH_PRIVATE_KEY`)
-for the deploy job.
+to `main` (lint → build standalone → scp to the instance → flip `current` symlink
+→ `systemctl restart` → verify). It is **SSH-only** — no Terraform runs in CI. The
+instance is provisioned/updated manually with `terraform apply` from this
+directory (same model as the backend); CI just ships the app to `STAGING_HOST`
+using `SSH_PRIVATE_KEY`.
 
 For a manual deploy from the repo root:
 

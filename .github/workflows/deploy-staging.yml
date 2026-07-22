@@ -5,12 +5,13 @@ name: Deploy Staging
 #
 # Model: Next.js `standalone` build shipped to a t4g.micro EC2 instance over SSH
 # (replaces the old static export -> S3 sync -> CloudFront invalidation).
-# Terraform still manages the instance; the app is built in CI and rsync'd to a
-# timestamped release dir, then the `current` symlink is flipped and the systemd
-# service restarted.
+#
+# Infrastructure is NOT managed here — the instance is provisioned manually with
+# Terraform (see terraform/heirloom-staging/README.md), the same way the backend
+# does it. CI only builds the app and ships it to the running box.
 #
 # Required in the repo's `staging` GitHub environment:
-#   - secret AWS_ROLE_ARN      (OIDC role for the Terraform job; state + provisioning)
+#   - secret STAGING_HOST      (instance public host: heirloom-staging.storywriter.net or its EIP)
 #   - secret SSH_PRIVATE_KEY   (private half of the deploy keypair on the instance)
 #   - var    NEXT_PUBLIC_API_URL (optional; defaults to the staging API below)
 
@@ -19,10 +20,6 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
-permissions:
-  id-token: write
-  contents: read
-
 # One deploy at a time: queued runs wait instead of racing a deploy in flight.
 concurrency:
   group: deploy-heirloom-staging
@@ -30,8 +27,6 @@ concurrency:
 
 env:
   NODE_VERSION: '24'
-  AWS_REGION: us-east-1
-  TERRAFORM_DIR: terraform/heirloom-staging
   APP_NAME: heirloom-staging
 
 jobs:
@@ -52,60 +47,6 @@ jobs:
 
       - name: Run linting
         run: npm run lint
-
-  infrastructure:
-    runs-on: ubuntu-latest
-    environment: staging
-    outputs:
-      host: ${{ steps.terraform.outputs.elastic_ip }}
-      domain: ${{ steps.terraform.outputs.domain_name }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v4
-        with:
-          terraform_version: "~1.0"
-          terraform_wrapper: false
-
-      - name: Terraform Init
-        working-directory: ${{ env.TERRAFORM_DIR }}
-        run: terraform init
-
-      - name: Terraform Plan / Apply
-        working-directory: ${{ env.TERRAFORM_DIR }}
-        run: |
-          EXIT_CODE=0
-          terraform plan -detailed-exitcode -out=tfplan || EXIT_CODE=$?
-
-          case $EXIT_CODE in
-            0)
-              echo "✅ Infrastructure is up to date - no changes needed"
-              ;;
-            2)
-              echo "⚠️  Infrastructure changes detected (first run or drift)"
-              terraform apply -auto-approve tfplan
-              echo "✅ Infrastructure applied"
-              ;;
-            *)
-              echo "❌ Terraform plan failed (exit code $EXIT_CODE)"
-              exit 1
-              ;;
-          esac
-
-      - name: Extract Terraform Outputs
-        id: terraform
-        working-directory: ${{ env.TERRAFORM_DIR }}
-        run: |
-          echo "elastic_ip=$(terraform output -raw elastic_ip)" >> $GITHUB_OUTPUT
-          echo "domain_name=$(terraform output -raw domain_name)" >> $GITHUB_OUTPUT
 
   build:
     needs: [lint]
@@ -156,7 +97,7 @@ jobs:
           retention-days: 7
 
   deploy:
-    needs: [infrastructure, build]
+    needs: [build]
     runs-on: ubuntu-latest
     environment: staging
     steps:
@@ -170,16 +111,16 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H ${{ needs.infrastructure.outputs.host }} >> ~/.ssh/known_hosts
+          ssh-keyscan -H ${{ secrets.STAGING_HOST }} >> ~/.ssh/known_hosts
 
       - name: Copy artifact to server
         run: |
           scp -i ~/.ssh/deploy_key heirloom-${{ github.sha }}.tar.gz \
-            deploy@${{ needs.infrastructure.outputs.host }}:/tmp/heirloom.tar.gz
+            deploy@${{ secrets.STAGING_HOST }}:/tmp/heirloom.tar.gz
 
       - name: Extract, activate, restart
         run: |
-          ssh -i ~/.ssh/deploy_key deploy@${{ needs.infrastructure.outputs.host }} \
+          ssh -i ~/.ssh/deploy_key deploy@${{ secrets.STAGING_HOST }} \
             APP_NAME='${{ env.APP_NAME }}' SHA='${{ github.sha }}' 'bash -s' << 'DEPLOY_SCRIPT'
           set -e
 
@@ -211,23 +152,24 @@ jobs:
         run: rm -f ~/.ssh/deploy_key
 
   verify-deployment:
-    needs: [infrastructure, deploy]
+    needs: [deploy]
     runs-on: ubuntu-latest
+    environment: staging
     steps:
       - name: Verify deployment
         run: |
-          DOMAIN=${{ needs.infrastructure.outputs.domain }}
-          echo "Verifying deployment at https://${DOMAIN}"
+          HOST=${{ secrets.STAGING_HOST }}
+          echo "Verifying deployment at https://${HOST}"
 
           # Give the service a moment to come up after restart
           sleep 5
 
           for path in "/" "/login"; do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "https://${DOMAIN}${path}" || echo "000")
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "https://${HOST}${path}" || echo "000")
             if [[ "$CODE" =~ ^(200|301|302|307)$ ]]; then
-              echo "✅ https://${DOMAIN}${path} -> $CODE"
+              echo "✅ https://${HOST}${path} -> $CODE"
             else
-              echo "❌ https://${DOMAIN}${path} -> $CODE"
+              echo "❌ https://${HOST}${path} -> $CODE"
               exit 1
             fi
           done
