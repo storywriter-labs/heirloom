@@ -1,8 +1,18 @@
 name: Deploy Staging
 
 # Merges to main deploy heirloom-staging.storywriter.net (matching the
-# frontend/backend release scheme). Terraform state is checked on every run:
-# an empty state or drift triggers an apply, an up-to-date state is a no-op.
+# frontend/backend release scheme).
+#
+# Model: Next.js `standalone` build shipped to a t4g.micro EC2 instance over SSH
+# (replaces the old static export -> S3 sync -> CloudFront invalidation).
+# Terraform still manages the instance; the app is built in CI and rsync'd to a
+# timestamped release dir, then the `current` symlink is flipped and the systemd
+# service restarted.
+#
+# Required in the repo's `staging` GitHub environment:
+#   - secret AWS_ROLE_ARN      (OIDC role for the Terraform job; state + provisioning)
+#   - secret SSH_PRIVATE_KEY   (private half of the deploy keypair on the instance)
+#   - var    NEXT_PUBLIC_API_URL (optional; defaults to the staging API below)
 
 on:
   push:
@@ -22,6 +32,7 @@ env:
   NODE_VERSION: '24'
   AWS_REGION: us-east-1
   TERRAFORM_DIR: terraform/heirloom-staging
+  APP_NAME: heirloom-staging
 
 jobs:
   lint:
@@ -46,8 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: staging
     outputs:
-      s3_bucket: ${{ steps.terraform.outputs.s3_bucket_name }}
-      cloudfront_id: ${{ steps.terraform.outputs.cloudfront_distribution_id }}
+      host: ${{ steps.terraform.outputs.elastic_ip }}
       domain: ${{ steps.terraform.outputs.domain_name }}
     steps:
       - name: Checkout code
@@ -94,8 +104,7 @@ jobs:
         id: terraform
         working-directory: ${{ env.TERRAFORM_DIR }}
         run: |
-          echo "s3_bucket_name=$(terraform output -raw s3_bucket_name)" >> $GITHUB_OUTPUT
-          echo "cloudfront_distribution_id=$(terraform output -raw cloudfront_distribution_id)" >> $GITHUB_OUTPUT
+          echo "elastic_ip=$(terraform output -raw elastic_ip)" >> $GITHUB_OUTPUT
           echo "domain_name=$(terraform output -raw domain_name)" >> $GITHUB_OUTPUT
 
   build:
@@ -115,7 +124,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build static export
+      - name: Build (standalone)
         env:
           # Baked in at build time; staging builds always target the staging API
           NEXT_PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL || 'https://staging-api.storywriter.net/api' }}
@@ -123,21 +132,27 @@ jobs:
           echo "Building with NEXT_PUBLIC_API_URL: $NEXT_PUBLIC_API_URL"
           npm run build
 
-      - name: Validate build output
+      - name: Assemble standalone bundle
         run: |
-          for f in out/index.html out/login.html out/dashboard.html out/404.html; do
-            if [ ! -f "$f" ]; then
-              echo "❌ Build failed: $f not found in static export"
-              exit 1
-            fi
-          done
-          echo "✅ Build validation passed"
+          # server.js only serves public/ and .next/static if they sit alongside it.
+          if [ -d public ]; then cp -r public .next/standalone/; fi
+          mkdir -p .next/standalone/.next
+          cp -r .next/static .next/standalone/.next/
 
-      - name: Upload build artifacts
+          if [ ! -f .next/standalone/server.js ]; then
+            echo "❌ Build failed: .next/standalone/server.js not found (is output:'standalone' set?)"
+            exit 1
+          fi
+          echo "✅ Standalone bundle assembled"
+
+      - name: Create deployment artifact
+        run: tar -czf heirloom-${{ github.sha }}.tar.gz -C .next/standalone .
+
+      - name: Upload deployment artifact
         uses: actions/upload-artifact@v7
         with:
           name: heirloom-build-staging
-          path: out/
+          path: heirloom-${{ github.sha }}.tar.gz
           retention-days: 7
 
   deploy:
@@ -145,80 +160,74 @@ jobs:
     runs-on: ubuntu-latest
     environment: staging
     steps:
-      - name: Download build artifacts
+      - name: Download deployment artifact
         uses: actions/download-artifact@v7
         with:
           name: heirloom-build-staging
-          path: out/
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Create deployment backup
+      - name: Setup SSH
         run: |
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          BACKUP_KEY="backups/staging/${TIMESTAMP}/"
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ needs.infrastructure.outputs.host }} >> ~/.ssh/known_hosts
 
-          echo "Creating backup at s3://${{ needs.infrastructure.outputs.s3_bucket }}/${BACKUP_KEY}"
-          aws s3 sync s3://${{ needs.infrastructure.outputs.s3_bucket }}/ \
-            s3://${{ needs.infrastructure.outputs.s3_bucket }}/${BACKUP_KEY} \
-            --exclude "backups/*" || echo "No existing files to backup"
-
-      - name: Deploy to S3
+      - name: Copy artifact to server
         run: |
-          BUCKET=${{ needs.infrastructure.outputs.s3_bucket }}
-          echo "Deploying to s3://${BUCKET}"
+          scp -i ~/.ssh/deploy_key heirloom-${{ github.sha }}.tar.gz \
+            deploy@${{ needs.infrastructure.outputs.host }}:/tmp/heirloom.tar.gz
 
-          # Hashed/static assets: immutable, long cache. HTML and RSC .txt
-          # payloads are unhashed and change every deploy, so they're synced
-          # separately with no-cache below. backups/ is excluded so --delete
-          # never touches it.
-          aws s3 sync ./out s3://${BUCKET}/ --delete \
-            --exclude "backups/*" --exclude "*.html" --exclude "*.txt" \
-            --cache-control "public, max-age=31536000, immutable"
-
-          aws s3 sync ./out s3://${BUCKET}/ \
-            --exclude "*" --include "*.html" --include "*.txt" \
-            --cache-control "public, max-age=0, must-revalidate"
-
-      - name: Invalidate CloudFront distribution
-        id: invalidate
+      - name: Extract, activate, restart
         run: |
-          echo "Invalidating CloudFront distribution: ${{ needs.infrastructure.outputs.cloudfront_id }}"
-          INVALIDATION_ID=$(aws cloudfront create-invalidation \
-            --distribution-id ${{ needs.infrastructure.outputs.cloudfront_id }} \
-            --paths "/*" \
-            --query 'Invalidation.Id' \
-            --output text)
+          ssh -i ~/.ssh/deploy_key deploy@${{ needs.infrastructure.outputs.host }} \
+            APP_NAME='${{ env.APP_NAME }}' SHA='${{ github.sha }}' 'bash -s' << 'DEPLOY_SCRIPT'
+          set -e
 
-          echo "invalidation_id=${INVALIDATION_ID}" >> $GITHUB_OUTPUT
+          APP_DIR="/var/www/${APP_NAME}"
+          RELEASE_DIR="${APP_DIR}/releases/${SHA}"
 
-      - name: Wait for CloudFront invalidation
-        run: |
-          aws cloudfront wait invalidation-completed \
-            --distribution-id ${{ needs.infrastructure.outputs.cloudfront_id }} \
-            --id ${{ steps.invalidate.outputs.invalidation_id }}
-          echo "✅ CloudFront invalidation completed"
+          echo "==> Unpacking release ${SHA}..."
+          rm -rf "${RELEASE_DIR}"
+          mkdir -p "${RELEASE_DIR}"
+          tar -xzf /tmp/heirloom.tar.gz -C "${RELEASE_DIR}"
+          rm -f /tmp/heirloom.tar.gz
+
+          echo "==> Flipping current symlink..."
+          ln -sfn "${RELEASE_DIR}" "${APP_DIR}/current"
+          sudo chown -R deploy:www-data "${APP_DIR}/releases/${SHA}"
+
+          echo "==> Restarting service..."
+          sudo systemctl restart "${APP_NAME}"
+
+          echo "==> Pruning old releases (keep last 5)..."
+          cd "${APP_DIR}/releases"
+          ls -t | tail -n +6 | xargs -r rm -rf
+
+          echo "==> Deployed ${SHA}"
+          DEPLOY_SCRIPT
+
+      - name: Cleanup
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
 
   verify-deployment:
     needs: [infrastructure, deploy]
     runs-on: ubuntu-latest
-    environment: staging
     steps:
       - name: Verify deployment
         run: |
           DOMAIN=${{ needs.infrastructure.outputs.domain }}
           echo "Verifying deployment at https://${DOMAIN}"
 
-          # /login exercises the CloudFront url-rewrite function, not just the root object
+          # Give the service a moment to come up after restart
+          sleep 5
+
           for path in "/" "/login"; do
-            if curl -f -s -m 10 -o /dev/null "https://${DOMAIN}${path}"; then
-              echo "✅ https://${DOMAIN}${path} is accessible"
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "https://${DOMAIN}${path}" || echo "000")
+            if [[ "$CODE" =~ ^(200|301|302|307)$ ]]; then
+              echo "✅ https://${DOMAIN}${path} -> $CODE"
             else
-              echo "❌ https://${DOMAIN}${path} failed"
+              echo "❌ https://${DOMAIN}${path} -> $CODE"
               exit 1
             fi
           done

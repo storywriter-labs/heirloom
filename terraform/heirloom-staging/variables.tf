@@ -1,3 +1,14 @@
+# Heirloom Staging Environment variables.
+#
+# Non-sensitive values default here. Account-specific IDs and the deploy key are
+# required via terraform.tfvars (gitignored) — see terraform.tfvars.example.
+
+variable "aws_region" {
+  description = "AWS region to deploy into"
+  type        = string
+  default     = "us-east-1"
+}
+
 variable "environment" {
   description = "Environment name (staging/production)"
   type        = string
@@ -9,20 +20,69 @@ variable "environment" {
   }
 }
 
+variable "app_name" {
+  description = "Application name for resource naming"
+  type        = string
+  default     = "heirloom-staging"
+}
+
 variable "domain_name" {
   description = "Domain name for the Heirloom application"
   type        = string
   default     = "heirloom-staging.storywriter.net"
 }
 
-variable "s3_bucket_name" {
-  description = "S3 bucket name for the static export"
+variable "instance_type" {
+  description = "EC2 instance type"
   type        = string
-  default     = "storywriter-staging-heirloom"
+  default     = "t4g.micro"
 }
 
-variable "price_class" {
-  description = "CloudFront price class"
+variable "app_port" {
+  description = "Localhost port the Next.js server listens on"
+  type        = number
+  default     = 3000
+}
+
+variable "deploy_branch" {
+  description = "Git branch that deploys to this environment"
   type        = string
-  default     = "PriceClass_100"
+  default     = "main"
+}
+
+# --- Required via terraform.tfvars ---
+
+variable "vpc_id" {
+  description = "ID of the existing VPC to deploy into"
+  type        = string
+}
+
+variable "subnet_id" {
+  description = "ID of the public subnet for the EC2 instance"
+  type        = string
+}
+
+variable "key_pair_name" {
+  description = "Name of the existing AWS key pair for SSH access"
+  type        = string
+}
+
+variable "route53_zone_id" {
+  description = "Route 53 hosted zone ID for storywriter.net"
+  type        = string
+}
+
+variable "allowed_ssh_cidrs" {
+  description = "List of CIDR blocks allowed to SSH into the server"
+  type        = list(string)
+}
+
+variable "admin_email" {
+  description = "Email address for Let's Encrypt SSL certificate notifications"
+  type        = string
+}
+
+variable "github_actions_public_key" {
+  description = "Public SSH key for the deploy user (GitHub Actions + manual SSH)"
+  type        = string
 }
