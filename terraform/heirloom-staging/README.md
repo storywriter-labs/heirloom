@@ -6,11 +6,16 @@ This replaces the previous static export (S3 + CloudFront). See
 `HEIRLOOM_HOSTING.md` ("Node server: EC2 vs. ECS") at the storywriter repo root
 for the decision and rationale, and Fizzy #71/#72.
 
-The environment is a thin wrapper around the reusable
-[`../modules/heirloom-server`](../modules/heirloom-server) module (cloned from
-`backend/terraform/modules/storywriter-server`, minus PostgreSQL/PHP/Composer/SSM
+The config is flat — a single environment, so all resources live in `main.tf`
+directly rather than behind a module. It follows the pattern of
+`backend/terraform/modules/storywriter-server`, minus PostgreSQL/PHP/Composer/SSM,
 since Heirloom is a rendering layer only — all data, auth, and secrets live in the
-Laravel backend, and `NEXT_PUBLIC_*` values are baked in at build time).
+Laravel backend, and `NEXT_PUBLIC_*` values are baked in at build time. (If a
+production environment is ever added, extract these resources into a shared module
+then.)
+
+Files: `main.tf` (provider + backend + resources), `variables.tf`, `user-data.sh`
+(the box's provisioning script), and a gitignored `terraform.tfvars` you create.
 
 State lives in the shared bucket `storywriter-terraform-state-548846592016` under
 `heirloom-staging/terraform.tfstate`, locked via the DynamoDB table
@@ -45,8 +50,18 @@ after verifying it, rather than doing both in one apply.
    - Private half → the heirloom repo's `staging` GitHub environment as the
      `SSH_PRIVATE_KEY` secret.
 
-2. **`terraform.tfvars`** (gitignored) — copy `terraform.tfvars.example` and fill
-   in the VPC/subnet/zone IDs, `admin_email`, SSH CIDRs, and the deploy public key.
+2. **`terraform.tfvars`** (gitignored) — create it with the required inputs
+   declared in `variables.tf` (the ones with no default):
+
+   ```hcl
+   vpc_id                    = "vpc-..."
+   subnet_id                 = "subnet-..."
+   key_pair_name             = "storywriter-staging-ec2-tf" # EC2 login keypair
+   route53_zone_id           = "Z0402623XN8X8KI30YSL"        # storywriter.net zone
+   admin_email               = "web@almerindo.net"           # Let's Encrypt
+   allowed_ssh_cidrs         = ["0.0.0.0/0"]                  # prefer specific CIDRs
+   github_actions_public_key = "ssh-ed25519 AAAA... heirloom-staging-deploy"
+   ```
 
 3. **GitHub `staging` environment** needs two secrets for the deploy workflow:
    - `SSH_PRIVATE_KEY` — private half of the deploy keypair (see step 1).
@@ -68,6 +83,13 @@ terraform plan     # ~5 resources: SG, EIP + association, EC2 instance, Route 53
                    # record (plus the destroys listed under "Cutover" on first run)
 terraform apply
 ```
+
+> **State migration (one-time):** the config was flattened from a module into
+> these root resources. `moved.tf` remaps the existing state so the next `plan`
+> shows *"N resources will be moved"* with **no** create/destroy — apply it, then
+> `moved.tf` can be deleted. If a plan ever wants to *destroy and recreate* the
+> instance instead, stop: the moves didn't apply and the state addresses need
+> reconciling before you continue.
 
 Notes:
 
@@ -99,7 +121,7 @@ cp -r public .next/standalone/ 2>/dev/null || true
 cp -r .next/static .next/standalone/.next/
 tar -czf heirloom.tar.gz -C .next/standalone .
 
-HOST=$(terraform -chdir=terraform/heirloom-staging output -raw elastic_ip)
+HOST=heirloom-staging.storywriter.net   # DNS A record -> the instance's EIP
 scp -i ~/.ssh/heirloom-staging-deploy heirloom.tar.gz deploy@"$HOST":/tmp/heirloom.tar.gz
 ssh -i ~/.ssh/heirloom-staging-deploy deploy@"$HOST" '
   set -e

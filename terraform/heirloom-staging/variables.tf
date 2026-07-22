@@ -75,6 +75,10 @@ variable "route53_zone_id" {
 variable "allowed_ssh_cidrs" {
   description = "List of CIDR blocks allowed to SSH into the server"
   type        = list(string)
+  validation {
+    condition     = length(var.allowed_ssh_cidrs) > 0
+    error_message = "You must specify at least one CIDR block for SSH access."
+  }
 }
 
 variable "admin_email" {
