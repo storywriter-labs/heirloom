@@ -1,0 +1,19 @@
+# Copy to terraform.tfvars (gitignored) and fill in.
+# The non-sensitive values (region, domain, app_name, instance_type,
+# deploy_branch, app_port) default in variables.tf and can be omitted.
+
+# --- Existing AWS network / DNS (shared staging account) ---
+vpc_id          = "vpc-xxxxxxxxxxxxxxxxx"
+subnet_id       = "subnet-xxxxxxxxxxxxxxxxx"
+key_pair_name   = "storywriter-staging-ec2-tf" # EC2 login keypair (ubuntu user)
+route53_zone_id = "Z0402623XN8X8KI30YSL"        # storywriter.net hosted zone
+admin_email     = "web@almerindo.net"           # Let's Encrypt notifications
+
+# SSH access control. Prefer specific CIDRs over 0.0.0.0/0.
+allowed_ssh_cidrs = ["0.0.0.0/0"]
+
+# Public half of the deploy keypair. The PRIVATE half goes in the heirloom repo's
+# `staging` GitHub environment as the SSH_PRIVATE_KEY secret. Generate a fresh
+# keypair for Heirloom (do NOT reuse the backend's):
+#   ssh-keygen -t ed25519 -f ~/.ssh/heirloom-staging-deploy -C heirloom-staging-deploy
+github_actions_public_key = "ssh-ed25519 AAAA... heirloom-staging-deploy"

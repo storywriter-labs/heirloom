@@ -1,10 +1,12 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // Static export served from S3 + CloudFront (see terraform/heirloom-staging/README.md).
-  // No server runtime: rules out SSR, middleware, Server Actions, dynamic route
-  // params, and default next/image optimization.
-  output: "export",
+  // Node server on EC2 (see terraform/heirloom-staging/README.md). `standalone`
+  // emits a self-contained .next/standalone/server.js with a pruned node_modules,
+  // which the systemd unit runs directly (no `next start`, no full install on the
+  // box). This restores SSR, middleware, dynamic route params, and per-URL
+  // metadata that `output: 'export'` gave up.
+  output: "standalone",
 };
 
 export default nextConfig;
