@@ -6,15 +6,24 @@ This replaces the previous static export (S3 + CloudFront). See
 `HEIRLOOM_HOSTING.md` ("Node server: EC2 vs. ECS") at the storywriter repo root
 for the decision and rationale, and Fizzy #71/#72.
 
-The environment is a thin wrapper around the reusable
-[`../modules/heirloom-server`](../modules/heirloom-server) module (cloned from
-`backend/terraform/modules/storywriter-server`, minus PostgreSQL/PHP/Composer/SSM
-since Heirloom is a rendering layer only — all data, auth, and secrets live in the
-Laravel backend, and `NEXT_PUBLIC_*` values are baked in at build time).
+The layout mirrors `backend/terraform`: a reusable module under
+`terraform/modules/heirloom-server/` plus thin per-environment wrappers under
+`terraform/environments/<env>/`. This directory (`environments/staging/`) wires
+`terraform.tfvars` into that module; `environments/prod/` is the same shape,
+ready to fill in.
+
+The module follows `backend/terraform/modules/storywriter-server`, minus
+PostgreSQL/PHP/Composer/SSM, since Heirloom is a rendering layer only — all data,
+auth, and secrets live in the Laravel backend, and `NEXT_PUBLIC_*` values are baked
+in at build time.
+
+Files in this env: `backend.tf` (S3 state config), `main.tf` (provider + variable
+declarations + module call), `outputs.tf`, and a gitignored `terraform.tfvars` you
+create. The provisioning script (`user-data.sh`) and resources live in the module.
 
 State lives in the shared bucket `storywriter-terraform-state-548846592016` under
-`heirloom-staging/terraform.tfstate`, locked via the DynamoDB table
-`storywriter-terraform-locks`.
+`heirloom-staging/terraform.tfstate` (see the note in `backend.tf` on why the key
+keeps the old name), with S3-native locking (`use_lockfile`).
 
 ## Cutover from the static setup
 
@@ -45,12 +54,27 @@ after verifying it, rather than doing both in one apply.
    - Private half → the heirloom repo's `staging` GitHub environment as the
      `SSH_PRIVATE_KEY` secret.
 
-2. **`terraform.tfvars`** (gitignored) — copy `terraform.tfvars.example` and fill
-   in the VPC/subnet/zone IDs, `admin_email`, SSH CIDRs, and the deploy public key.
+2. **`terraform.tfvars`** (gitignored) — create it with the required inputs
+   declared in `variables.tf` (the ones with no default):
 
-3. **GitHub `staging` environment** must also have the `AWS_ROLE_ARN` OIDC secret
-   (used by the Terraform job) — the same role the static setup used; its trust
-   policy already covers `repo:storywriter-labs/heirloom:*`.
+   ```hcl
+   vpc_id                    = "vpc-..."
+   subnet_id                 = "subnet-..."
+   key_pair_name             = "storywriter-staging-ec2-tf" # EC2 login keypair
+   route53_zone_id           = "Z0402623XN8X8KI30YSL"        # storywriter.net zone
+   admin_email               = "web@almerindo.net"           # Let's Encrypt
+   allowed_ssh_cidrs         = ["0.0.0.0/0"]                  # prefer specific CIDRs
+   github_actions_public_key = "ssh-ed25519 AAAA... heirloom-staging-deploy"
+   ```
+
+3. **GitHub `staging` environment** needs two secrets for the deploy workflow:
+   - `SSH_PRIVATE_KEY` — private half of the deploy keypair (see step 1).
+   - `STAGING_HOST` — the instance's public host, e.g.
+     `heirloom-staging.storywriter.net` (or its Elastic IP).
+
+   CI does **not** run Terraform (see below), so no AWS/OIDC secret is required
+   by the workflow — infra is provisioned manually with the credentials you run
+   `terraform` with locally.
 
 ## Provisioning
 
@@ -58,11 +82,18 @@ From this directory, with AWS credentials for the shared state bucket
 (`export AWS_PROFILE=storywriter` for local runs):
 
 ```bash
-terraform init
-terraform plan     # ~5 resources: SG, EIP + association, EC2 instance, Route 53 A
-                   # record (plus the destroys listed under "Cutover" on first run)
+terraform init -reconfigure   # -reconfigure: the backend's lock/profile settings
+                              # changed from the original inline block
+terraform plan                # should report NO changes for the already-live box
 terraform apply
 ```
+
+> **`moved.tf` (defensive, one-time):** a brief PR flattened the module into root
+> resources. If that was never `apply`d — the normal case — the live box is still
+> tracked as `module.heirloom_server.*`, `plan` shows no changes, and `moved.tf` is
+> a no-op you can delete. If the flatten *was* applied, `moved.tf` moves the state
+> back under the module. Either way, if a `plan` ever wants to **destroy and
+> recreate** the instance, stop and reconcile the state addresses first.
 
 Notes:
 
@@ -80,10 +111,11 @@ Notes:
 ## Deploying the app
 
 The normal path is CI: `.github/workflows/deploy-staging.yml` runs on every merge
-to `main` (lint → terraform plan/apply → build standalone → scp to the instance →
-flip `current` symlink → `systemctl restart` → verify). It authenticates to AWS
-via OIDC (`AWS_ROLE_ARN`) for the Terraform job and over SSH (`SSH_PRIVATE_KEY`)
-for the deploy job.
+to `main` (lint → build standalone → scp to the instance → flip `current` symlink
+→ `systemctl restart` → verify). It is **SSH-only** — no Terraform runs in CI. The
+instance is provisioned/updated manually with `terraform apply` from this
+directory (same model as the backend); CI just ships the app to `STAGING_HOST`
+using `SSH_PRIVATE_KEY`.
 
 For a manual deploy from the repo root:
 
@@ -93,7 +125,7 @@ cp -r public .next/standalone/ 2>/dev/null || true
 cp -r .next/static .next/standalone/.next/
 tar -czf heirloom.tar.gz -C .next/standalone .
 
-HOST=$(terraform -chdir=terraform/heirloom-staging output -raw elastic_ip)
+HOST=heirloom-staging.storywriter.net   # DNS A record -> the instance's EIP
 scp -i ~/.ssh/heirloom-staging-deploy heirloom.tar.gz deploy@"$HOST":/tmp/heirloom.tar.gz
 ssh -i ~/.ssh/heirloom-staging-deploy deploy@"$HOST" '
   set -e
@@ -121,3 +153,12 @@ curl -sI https://heirloom-staging.storywriter.net/         # 200 (SSR home)
 curl -sI https://heirloom-staging.storywriter.net/login    # 200 (SSR login)
 curl -sI http://heirloom-staging.storywriter.net/          # 301 -> https (certbot redirect)
 ```
+
+## Production
+
+`../prod/` is the same wiring against the same module, pre-scaffolded but not yet
+applied. Before standing it up: set `domain_name` (no default — confirm the prod
+hostname) and the other required inputs in `../prod/terraform.tfvars`, generate a
+prod-specific deploy keypair, and add a gated prod deploy workflow (the staging
+workflow deploys on merge to `main`; prod should trigger on `v*` tags, like the
+backend's `deploy-prod.yml`). See the header comment in `../prod/main.tf`.

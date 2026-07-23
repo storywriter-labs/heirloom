@@ -1,3 +1,5 @@
+# Re-export module outputs for the staging environment
+
 output "instance_id" {
   description = "ID of the EC2 instance"
   value       = module.heirloom_server.instance_id
