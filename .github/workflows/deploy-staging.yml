@@ -7,7 +7,7 @@ name: Deploy Staging
 # (replaces the old static export -> S3 sync -> CloudFront invalidation).
 #
 # Infrastructure is NOT managed here — the instance is provisioned manually with
-# Terraform (see terraform/heirloom-staging/README.md), the same way the backend
+# Terraform (see terraform/environments/staging/README.md), the same way the backend
 # does it. CI only builds the app and ships it to the running box.
 #
 # Required in the repo's `staging` GitHub environment:

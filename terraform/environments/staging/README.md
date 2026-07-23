@@ -6,20 +6,24 @@ This replaces the previous static export (S3 + CloudFront). See
 `HEIRLOOM_HOSTING.md` ("Node server: EC2 vs. ECS") at the storywriter repo root
 for the decision and rationale, and Fizzy #71/#72.
 
-The config is flat — a single environment, so all resources live in `main.tf`
-directly rather than behind a module. It follows the pattern of
-`backend/terraform/modules/storywriter-server`, minus PostgreSQL/PHP/Composer/SSM,
-since Heirloom is a rendering layer only — all data, auth, and secrets live in the
-Laravel backend, and `NEXT_PUBLIC_*` values are baked in at build time. (If a
-production environment is ever added, extract these resources into a shared module
-then.)
+The layout mirrors `backend/terraform`: a reusable module under
+`terraform/modules/heirloom-server/` plus thin per-environment wrappers under
+`terraform/environments/<env>/`. This directory (`environments/staging/`) wires
+`terraform.tfvars` into that module; `environments/prod/` is the same shape,
+ready to fill in.
 
-Files: `main.tf` (provider + backend + resources), `variables.tf`, `user-data.sh`
-(the box's provisioning script), and a gitignored `terraform.tfvars` you create.
+The module follows `backend/terraform/modules/storywriter-server`, minus
+PostgreSQL/PHP/Composer/SSM, since Heirloom is a rendering layer only — all data,
+auth, and secrets live in the Laravel backend, and `NEXT_PUBLIC_*` values are baked
+in at build time.
+
+Files in this env: `backend.tf` (S3 state config), `main.tf` (provider + variable
+declarations + module call), `outputs.tf`, and a gitignored `terraform.tfvars` you
+create. The provisioning script (`user-data.sh`) and resources live in the module.
 
 State lives in the shared bucket `storywriter-terraform-state-548846592016` under
-`heirloom-staging/terraform.tfstate`, locked via the DynamoDB table
-`storywriter-terraform-locks`.
+`heirloom-staging/terraform.tfstate` (see the note in `backend.tf` on why the key
+keeps the old name), with S3-native locking (`use_lockfile`).
 
 ## Cutover from the static setup
 
@@ -78,18 +82,18 @@ From this directory, with AWS credentials for the shared state bucket
 (`export AWS_PROFILE=storywriter` for local runs):
 
 ```bash
-terraform init
-terraform plan     # ~5 resources: SG, EIP + association, EC2 instance, Route 53 A
-                   # record (plus the destroys listed under "Cutover" on first run)
+terraform init -reconfigure   # -reconfigure: the backend's lock/profile settings
+                              # changed from the original inline block
+terraform plan                # should report NO changes for the already-live box
 terraform apply
 ```
 
-> **State migration (one-time):** the config was flattened from a module into
-> these root resources. `moved.tf` remaps the existing state so the next `plan`
-> shows *"N resources will be moved"* with **no** create/destroy — apply it, then
-> `moved.tf` can be deleted. If a plan ever wants to *destroy and recreate* the
-> instance instead, stop: the moves didn't apply and the state addresses need
-> reconciling before you continue.
+> **`moved.tf` (defensive, one-time):** a brief PR flattened the module into root
+> resources. If that was never `apply`d — the normal case — the live box is still
+> tracked as `module.heirloom_server.*`, `plan` shows no changes, and `moved.tf` is
+> a no-op you can delete. If the flatten *was* applied, `moved.tf` moves the state
+> back under the module. Either way, if a `plan` ever wants to **destroy and
+> recreate** the instance, stop and reconcile the state addresses first.
 
 Notes:
 
@@ -149,3 +153,12 @@ curl -sI https://heirloom-staging.storywriter.net/         # 200 (SSR home)
 curl -sI https://heirloom-staging.storywriter.net/login    # 200 (SSR login)
 curl -sI http://heirloom-staging.storywriter.net/          # 301 -> https (certbot redirect)
 ```
+
+## Production
+
+`../prod/` is the same wiring against the same module, pre-scaffolded but not yet
+applied. Before standing it up: set `domain_name` (no default — confirm the prod
+hostname) and the other required inputs in `../prod/terraform.tfvars`, generate a
+prod-specific deploy keypair, and add a gated prod deploy workflow (the staging
+workflow deploys on merge to `main`; prod should trigger on `v*` tags, like the
+backend's `deploy-prod.yml`). See the header comment in `../prod/main.tf`.
