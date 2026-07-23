@@ -1,7 +1,7 @@
 name: Deploy Staging
 
-# Merges to main deploy heirloom-staging.storywriter.net (matching the
-# frontend/backend release scheme).
+# Merges to main deploy the staging host (matching the frontend/backend release
+# scheme).
 #
 # Model: Next.js `standalone` build shipped to a t4g.micro EC2 instance over SSH
 # (replaces the old static export -> S3 sync -> CloudFront invalidation).
@@ -11,9 +11,15 @@ name: Deploy Staging
 # does it. CI only builds the app and ships it to the running box.
 #
 # Required in the repo's `staging` GitHub environment:
-#   - secret STAGING_HOST      (instance public host: heirloom-staging.storywriter.net or its EIP)
+#   - secret STAGING_HOST      (instance public host: the staging domain or its EIP)
 #   - secret SSH_PRIVATE_KEY   (private half of the deploy keypair on the instance)
 #   - var    NEXT_PUBLIC_API_URL (optional; defaults to the staging API below)
+#
+# STAGING_HOST is deliberately a secret, so Actions masks it to `***` in logs and the
+# staging domain stays out of public run output. Access to the box is expected to be
+# restricted later; keep it a secret even while the host still answers publicly.
+# Because it is masked, the steps below assert it is non-empty rather than relying on
+# reading it back from the log.
 
 on:
   push:
@@ -107,20 +113,32 @@ jobs:
           name: heirloom-build-staging
 
       - name: Setup SSH
+        env:
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
         run: |
+          if [ -z "${STAGING_HOST}" ]; then
+            echo "❌ STAGING_HOST is empty — refusing to deploy to an unknown host"
+            exit 1
+          fi
+          echo "✅ STAGING_HOST is set (value masked in logs)"
+
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H ${{ secrets.STAGING_HOST }} >> ~/.ssh/known_hosts
+          ssh-keyscan -H "${STAGING_HOST}" >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Copy artifact to server
+        env:
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
         run: |
           scp -i ~/.ssh/deploy_key heirloom-${{ github.sha }}.tar.gz \
-            deploy@${{ secrets.STAGING_HOST }}:/tmp/heirloom.tar.gz
+            "deploy@${STAGING_HOST}:/tmp/heirloom.tar.gz"
 
       - name: Extract, activate, restart
+        env:
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
         run: |
-          ssh -i ~/.ssh/deploy_key deploy@${{ secrets.STAGING_HOST }} \
+          ssh -i ~/.ssh/deploy_key "deploy@${STAGING_HOST}" \
             APP_NAME='${{ env.APP_NAME }}' SHA='${{ github.sha }}' 'bash -s' << 'DEPLOY_SCRIPT'
           set -e
 
@@ -157,19 +175,36 @@ jobs:
     environment: staging
     steps:
       - name: Verify deployment
+        env:
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
         run: |
-          HOST=${{ secrets.STAGING_HOST }}
-          echo "Verifying deployment at https://${HOST}"
+          if [ -z "${STAGING_HOST}" ]; then
+            echo "❌ STAGING_HOST is empty — nothing to verify"
+            exit 1
+          fi
+
+          # `/` is still the stock create-next-app template, so a 200 there proves
+          # nothing about the app. `/login` is the real entry point — it is the route
+          # that shows the app actually rendered and was served by our build.
+          PATH_TO_CHECK="/login"
+          echo "Verifying deployment at ${PATH_TO_CHECK} (host masked in logs)"
 
           # Give the service a moment to come up after restart
           sleep 5
 
-          for path in "/" "/login"; do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "https://${HOST}${path}" || echo "000")
-            if [[ "$CODE" =~ ^(200|301|302|307)$ ]]; then
-              echo "✅ https://${HOST}${path} -> $CODE"
-            else
-              echo "❌ https://${HOST}${path} -> $CODE"
-              exit 1
-            fi
-          done
+          CODE=$(curl -s -o /tmp/verify.html -w "%{http_code}" -m 10 \
+            "https://${STAGING_HOST}${PATH_TO_CHECK}" || echo "000")
+
+          if [ "$CODE" != "200" ]; then
+            echo "❌ ${PATH_TO_CHECK} -> $CODE (expected 200)"
+            exit 1
+          fi
+          echo "✅ ${PATH_TO_CHECK} -> $CODE"
+
+          # A 200 can still be an error shell or a stale page — confirm the login UI
+          # itself is in the response body.
+          if ! grep -qi "Heirloom" /tmp/verify.html; then
+            echo "❌ ${PATH_TO_CHECK} returned 200 but the body does not look like the Heirloom login page"
+            exit 1
+          fi
+          echo "✅ ${PATH_TO_CHECK} body contains the Heirloom login page"
