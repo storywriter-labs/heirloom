@@ -36,7 +36,7 @@ export default function LoginPage() {
             localStorage.setItem('auth_token', data.token);
             router.push('/dashboard');
 
-        } catch (err) {
+        } catch {
             setError('Could not connect to server');
         } finally {
             setLoading(false);

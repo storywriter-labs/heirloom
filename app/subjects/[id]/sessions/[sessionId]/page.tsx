@@ -89,7 +89,7 @@ export default function SessionPage() {
                 }
             );
             setNarrative(result);
-        } catch (err) {
+        } catch {
             setError('Failed to generate narrative. Please try again.');
         } finally {
             setSynthesising(false);
