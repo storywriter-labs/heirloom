@@ -38,7 +38,7 @@ export default function NewSubjectPage() {
             });
 
             router.push(`/subjects/${subject.id}`);
-        } catch (err) {
+        } catch {
             setError('Failed to create subject. Please try again.');
         } finally {
             setLoading(false);
