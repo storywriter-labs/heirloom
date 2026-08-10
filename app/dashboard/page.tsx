@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { apiFetch } from '@/lib/api';
+import { subjectSlug } from '@/lib/slug';
 
 interface Subject {
     id: number;
@@ -131,11 +132,12 @@ export default function DashboardPage() {
                             );
 
                             const latestSession = subjectSessions[0];
+                            const slug = subjectSlug(subject, subjects);
 
                             return (
                                 <div
                                     key={subject.id}
-                                    onClick={() => router.push(`/subjects/${subject.id}`)}
+                                    onClick={() => router.push(`/subjects/${slug}`)}
                                     className="bg-white rounded-xl border border-gray-100 px-6 py-5 flex items-center justify-between cursor-pointer hover:border-gray-300 transition-colors"
                                 >
                                     <div>

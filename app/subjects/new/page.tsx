@@ -3,6 +3,8 @@
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { apiFetch } from '@/lib/api';
+import { slugify } from '@/lib/slug';
+import Breadcrumbs from '@/app/components/Breadcrumbs';
 
 export default function NewSubjectPage() {
     const router = useRouter();
@@ -37,7 +39,7 @@ export default function NewSubjectPage() {
                 }),
             });
 
-            router.push(`/subjects/${subject.id}`);
+            router.push(`/subjects/${slugify(subject.name)}`);
         } catch (err) {
             setError('Failed to create subject. Please try again.');
         } finally {
@@ -49,17 +51,16 @@ export default function NewSubjectPage() {
         <main className="min-h-screen bg-gray-50">
 
             {/* Nav */}
-            <nav className="bg-white border-b border-gray-100 px-6 py-4 flex items-center justify-between">
+            <nav className="bg-white border-b border-gray-100 px-6 py-4">
                 <h1 className="text-lg font-semibold text-gray-900">Heirloom</h1>
-                <button
-                    onClick={() => router.push('/dashboard')}
-                    className="text-sm text-gray-500 hover:text-gray-900 transition-colors"
-                >
-                    ← Back
-                </button>
             </nav>
 
             <div className="max-w-2xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+
+                <Breadcrumbs items={[
+                    { label: 'Dashboard', href: '/dashboard' },
+                    { label: 'New person' },
+                ]} />
 
                 <div className="mb-8">
                     <h2 className="text-xl font-semibold text-gray-900">Add a person</h2>

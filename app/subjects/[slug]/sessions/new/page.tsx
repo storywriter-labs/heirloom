@@ -1,16 +1,20 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 import { apiFetch } from '@/lib/api';
+import { resolveSubjectBySlug } from '@/lib/slug';
+import Breadcrumbs from '@/app/components/Breadcrumbs';
 
 type InputType = 'manual' | 'audio';
 
 export default function NewSessionPage() {
     const router = useRouter();
     const params = useParams();
-    const subjectId = params.id;
+    const slug = params.slug as string;
 
+    const [subjectId, setSubjectId] = useState<number | null>(null);
+    const [subjectName, setSubjectName] = useState('');
     const [inputType, setInputType] = useState<InputType>('manual');
     const [title, setTitle] = useState('');
     const [transcriptText, setTranscriptText] = useState('');
@@ -18,13 +22,30 @@ export default function NewSessionPage() {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState('');
 
+    useEffect(() => {
+        const token = localStorage.getItem('auth_token');
+        if (!token) {
+            router.push('/login');
+            return;
+        }
+
+        apiFetch('/heirloom/v1/subjects')
+            .then(({ data: allSubjects }) => {
+                const resolved = resolveSubjectBySlug(slug, allSubjects);
+                if (!resolved) throw new Error('Subject not found');
+                setSubjectId(resolved.id);
+                setSubjectName(resolved.name);
+            })
+            .catch(() => router.push('/dashboard'));
+    }, [slug, router]);
+
     async function handleSubmit(e: React.FormEvent) {
         e.preventDefault();
+        if (!subjectId) return;
         setError('');
         setLoading(true);
 
         try {
-            // Step 1 — create the session
             const session = await apiFetch('/heirloom/v1/sessions', {
                 method: 'POST',
                 body: JSON.stringify({
@@ -33,7 +54,6 @@ export default function NewSessionPage() {
                 }),
             });
 
-            // Step 2 — submit transcript (manual or audio)
             if (inputType === 'manual') {
                 await apiFetch(`/heirloom/v1/sessions/${session.id}/transcript`, {
                     method: 'POST',
@@ -57,7 +77,7 @@ export default function NewSessionPage() {
                 );
             }
 
-            router.push(`/subjects/${subjectId}/sessions/${session.id}`);
+            router.push(`/subjects/${slug}/sessions/${session.id}`);
 
         } catch (err) {
             setError('Something went wrong. Please try again.');
@@ -70,17 +90,17 @@ export default function NewSessionPage() {
         <main className="min-h-screen bg-gray-50">
 
             {/* Nav */}
-            <nav className="bg-white border-b border-gray-100 px-6 py-4 flex items-center justify-between">
+            <nav className="bg-white border-b border-gray-100 px-6 py-4">
                 <h1 className="text-lg font-semibold text-gray-900">Heirloom</h1>
-                <button
-                    onClick={() => router.push(`/subjects/${subjectId}`)}
-                    className="text-sm text-gray-500 hover:text-gray-900 transition-colors"
-                >
-                    ← Back
-                </button>
             </nav>
 
             <div className="max-w-2xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+
+                <Breadcrumbs items={[
+                    { label: 'Dashboard', href: '/dashboard' },
+                    { label: subjectName || slug, href: `/subjects/${slug}` },
+                    { label: 'New session' },
+                ]} />
 
                 <div className="mb-8">
                     <h2 className="text-xl font-semibold text-gray-900">New session</h2>
@@ -192,14 +212,14 @@ export default function NewSessionPage() {
                     <div className="flex items-center justify-between pt-2">
                         <button
                             type="button"
-                            onClick={() => router.push(`/subjects/${subjectId}`)}
+                            onClick={() => router.push(`/subjects/${slug}`)}
                             className="text-sm text-gray-500 hover:text-gray-900 transition-colors"
                         >
                             Cancel
                         </button>
                         <button
                             type="submit"
-                            disabled={loading}
+                            disabled={loading || !subjectId}
                             className="bg-gray-900 text-white text-sm px-6 py-2.5 rounded-lg hover:bg-gray-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                             {loading ? 'Saving...' : 'Save session'}

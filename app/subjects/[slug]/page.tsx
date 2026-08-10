@@ -3,6 +3,8 @@
 import { useEffect, useState } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 import { apiFetch } from '@/lib/api';
+import { resolveSubjectBySlug } from '@/lib/slug';
+import Breadcrumbs from '@/app/components/Breadcrumbs';
 
 interface Subject {
     id: number;
@@ -26,7 +28,7 @@ interface Session {
 export default function SubjectPage() {
     const router = useRouter();
     const params = useParams();
-    const id = params.id;
+    const slug = params.slug as string;
 
     const [subject, setSubject] = useState<Subject | null>(null);
     const [sessions, setSessions] = useState<Session[]>([]);
@@ -40,17 +42,23 @@ export default function SubjectPage() {
             return;
         }
 
-        Promise.all([
-            apiFetch(`/heirloom/v1/subjects/${id}`),
-            apiFetch(`/heirloom/v1/sessions?subject_id=${id}`),
-        ])
+        apiFetch('/heirloom/v1/subjects')
+            .then(({ data: allSubjects }) => {
+                const resolved = resolveSubjectBySlug(slug, allSubjects);
+                if (!resolved) throw new Error('Subject not found');
+
+                return Promise.all([
+                    apiFetch(`/heirloom/v1/subjects/${resolved.id}`),
+                    apiFetch(`/heirloom/v1/sessions?subject_id=${resolved.id}`),
+                ]);
+            })
             .then(([subjectData, sessionsData]) => {
                 setSubject(subjectData);
                 setSessions(sessionsData.data);
             })
             .catch(() => setError('Failed to load subject'))
             .finally(() => setLoading(false));
-    }, [id, router]);
+    }, [slug, router]);
 
     if (loading) {
         return (
@@ -72,17 +80,16 @@ export default function SubjectPage() {
         <main className="min-h-screen bg-gray-50">
 
             {/* Nav */}
-            <nav className="bg-white border-b border-gray-100 px-6 py-4 flex items-center justify-between">
+            <nav className="bg-white border-b border-gray-100 px-6 py-4">
                 <h1 className="text-lg font-semibold text-gray-900">Heirloom</h1>
-                <button
-                    onClick={() => router.push('/dashboard')}
-                    className="text-sm text-gray-500 hover:text-gray-900 transition-colors"
-                >
-                    ← Back
-                </button>
             </nav>
 
             <div className="max-w-2xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+
+                <Breadcrumbs items={[
+                    { label: 'Dashboard', href: '/dashboard' },
+                    { label: subject?.name ?? slug },
+                ]} />
 
                 {/* Subject header */}
                 <div className="flex items-start justify-between mb-8">
@@ -93,7 +100,7 @@ export default function SubjectPage() {
                         )}
                     </div>
                     <button
-                        onClick={() => router.push(`/subjects/${id}/sessions/new`)}
+                        onClick={() => router.push(`/subjects/${slug}/sessions/new`)}
                         className="bg-gray-900 text-white text-sm px-4 py-2 rounded-lg hover:bg-gray-700 transition-colors"
                     >
                         + New session
@@ -123,7 +130,7 @@ export default function SubjectPage() {
                     <div className="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
                         <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Sessions</h3>
                         <button
-                            onClick={() => router.push(`/subjects/${id}/sessions/new`)}
+                            onClick={() => router.push(`/subjects/${slug}/sessions/new`)}
                             className="text-xs text-gray-500 hover:text-gray-900 transition-colors"
                         >
                             + Add session
@@ -142,7 +149,7 @@ export default function SubjectPage() {
                             sessions.map(session => (
                                 <li
                                     key={session.id}
-                                    onClick={() => router.push(`/subjects/${id}/sessions/${session.id}`)}
+                                    onClick={() => router.push(`/subjects/${slug}/sessions/${session.id}`)}
                                     className="px-6 py-4 flex items-center justify-between cursor-pointer hover:bg-gray-50 transition-colors"
                                 >
                                     <div>
