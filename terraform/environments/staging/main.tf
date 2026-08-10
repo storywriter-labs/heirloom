@@ -129,4 +129,10 @@ module "heirloom_server" {
   allowed_ssh_cidrs         = var.allowed_ssh_cidrs
   admin_email               = var.admin_email
   github_actions_public_key = var.github_actions_public_key
+
+  # Neither value is a secret, so they are set here rather than in tfvars: the
+  # repo and the GitHub Environment name that the staging deploy job declares.
+  # They scope the role that opens port 22 for a deploy runner.
+  github_deploy_repository  = "storywriter-labs/heirloom"
+  github_deploy_environment = "staging"
 }
