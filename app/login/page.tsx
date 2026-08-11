@@ -17,7 +17,7 @@ export default function LoginPage() {
 
         try {
             console.log('Posting to:', process.env.NEXT_PUBLIC_API_URL);
-            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/v1/auth/login`, {
+            const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/auth/login`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -36,7 +36,7 @@ export default function LoginPage() {
             localStorage.setItem('auth_token', data.token);
             router.push('/dashboard');
 
-        } catch {
+        } catch (err) {
             setError('Could not connect to server');
         } finally {
             setLoading(false);
