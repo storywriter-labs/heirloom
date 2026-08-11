@@ -39,8 +39,13 @@ export default function NewSubjectPage() {
                 }),
             });
 
+<<<<<<< HEAD
             router.push(`/subjects/${slugify(subject.name)}`);
         } catch (err) {
+=======
+            router.push(`/subjects/${subject.id}`);
+        } catch {
+>>>>>>> 0f501755fad9621a7c4b7ac64b47e3f1c5b4a09d
             setError('Failed to create subject. Please try again.');
         } finally {
             setLoading(false);

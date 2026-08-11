@@ -1,0 +1,210 @@
+name: Deploy Staging
+
+# Merges to main deploy the staging host (matching the frontend/backend release
+# scheme).
+#
+# Model: Next.js `standalone` build shipped to a t4g.micro EC2 instance over SSH
+# (replaces the old static export -> S3 sync -> CloudFront invalidation).
+#
+# Infrastructure is NOT managed here — the instance is provisioned manually with
+# Terraform (see terraform/environments/staging/README.md), the same way the backend
+# does it. CI only builds the app and ships it to the running box.
+#
+# Required in the repo's `staging` GitHub environment:
+#   - secret STAGING_HOST      (instance public host: the staging domain or its EIP)
+#   - secret SSH_PRIVATE_KEY   (private half of the deploy keypair on the instance)
+#   - var    NEXT_PUBLIC_API_URL (optional; defaults to the staging API below)
+#
+# STAGING_HOST is deliberately a secret, so Actions masks it to `***` in logs and the
+# staging domain stays out of public run output. Access to the box is expected to be
+# restricted later; keep it a secret even while the host still answers publicly.
+# Because it is masked, the steps below assert it is non-empty rather than relying on
+# reading it back from the log.
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+# One deploy at a time: queued runs wait instead of racing a deploy in flight.
+concurrency:
+  group: deploy-heirloom-staging
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '24'
+  APP_NAME: heirloom-staging
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linting
+        run: npm run lint
+
+  build:
+    needs: [lint]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (standalone)
+        env:
+          # Baked in at build time; staging builds always target the staging API
+          NEXT_PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL || 'https://staging-api.storywriter.net/api' }}
+        run: |
+          echo "Building with NEXT_PUBLIC_API_URL: $NEXT_PUBLIC_API_URL"
+          npm run build
+
+      - name: Assemble standalone bundle
+        run: |
+          # server.js only serves public/ and .next/static if they sit alongside it.
+          if [ -d public ]; then cp -r public .next/standalone/; fi
+          mkdir -p .next/standalone/.next
+          cp -r .next/static .next/standalone/.next/
+
+          if [ ! -f .next/standalone/server.js ]; then
+            echo "❌ Build failed: .next/standalone/server.js not found (is output:'standalone' set?)"
+            exit 1
+          fi
+          echo "✅ Standalone bundle assembled"
+
+      - name: Create deployment artifact
+        run: tar -czf heirloom-${{ github.sha }}.tar.gz -C .next/standalone .
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: heirloom-build-staging
+          path: heirloom-${{ github.sha }}.tar.gz
+          retention-days: 7
+
+  deploy:
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: heirloom-build-staging
+
+      - name: Setup SSH
+        env:
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
+        run: |
+          if [ -z "${STAGING_HOST}" ]; then
+            echo "❌ STAGING_HOST is empty — refusing to deploy to an unknown host"
+            exit 1
+          fi
+          echo "✅ STAGING_HOST is set (value masked in logs)"
+
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${STAGING_HOST}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Copy artifact to server
+        env:
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
+        run: |
+          scp -i ~/.ssh/deploy_key heirloom-${{ github.sha }}.tar.gz \
+            "deploy@${STAGING_HOST}:/tmp/heirloom.tar.gz"
+
+      - name: Extract, activate, restart
+        env:
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
+        run: |
+          ssh -i ~/.ssh/deploy_key "deploy@${STAGING_HOST}" \
+            APP_NAME='${{ env.APP_NAME }}' SHA='${{ github.sha }}' 'bash -s' << 'DEPLOY_SCRIPT'
+          set -e
+
+          APP_DIR="/var/www/${APP_NAME}"
+          RELEASE_DIR="${APP_DIR}/releases/${SHA}"
+
+          echo "==> Unpacking release ${SHA}..."
+          rm -rf "${RELEASE_DIR}"
+          mkdir -p "${RELEASE_DIR}"
+          tar -xzf /tmp/heirloom.tar.gz -C "${RELEASE_DIR}"
+          rm -f /tmp/heirloom.tar.gz
+
+          echo "==> Flipping current symlink..."
+          ln -sfn "${RELEASE_DIR}" "${APP_DIR}/current"
+          sudo chown -R deploy:www-data "${APP_DIR}/releases/${SHA}"
+
+          echo "==> Restarting service..."
+          sudo systemctl restart "${APP_NAME}"
+
+          echo "==> Pruning old releases (keep last 5)..."
+          cd "${APP_DIR}/releases"
+          ls -t | tail -n +6 | xargs -r rm -rf
+
+          echo "==> Deployed ${SHA}"
+          DEPLOY_SCRIPT
+
+      - name: Cleanup
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
+
+  verify-deployment:
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Verify deployment
+        env:
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
+        run: |
+          if [ -z "${STAGING_HOST}" ]; then
+            echo "❌ STAGING_HOST is empty — nothing to verify"
+            exit 1
+          fi
+
+          # `/` is still the stock create-next-app template, so a 200 there proves
+          # nothing about the app. `/login` is the real entry point — it is the route
+          # that shows the app actually rendered and was served by our build.
+          PATH_TO_CHECK="/login"
+          echo "Verifying deployment at ${PATH_TO_CHECK} (host masked in logs)"
+
+          # Give the service a moment to come up after restart
+          sleep 5
+
+          CODE=$(curl -s -o /tmp/verify.html -w "%{http_code}" -m 10 \
+            "https://${STAGING_HOST}${PATH_TO_CHECK}" || echo "000")
+
+          if [ "$CODE" != "200" ]; then
+            echo "❌ ${PATH_TO_CHECK} -> $CODE (expected 200)"
+            exit 1
+          fi
+          echo "✅ ${PATH_TO_CHECK} -> $CODE"
+
+          # A 200 can still be an error shell or a stale page — confirm the login UI
+          # itself is in the response body.
+          if ! grep -qi "Heirloom" /tmp/verify.html; then
+            echo "❌ ${PATH_TO_CHECK} returned 200 but the body does not look like the Heirloom login page"
+            exit 1
+          fi
+          echo "✅ ${PATH_TO_CHECK} body contains the Heirloom login page"
