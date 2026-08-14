@@ -63,18 +63,34 @@ after verifying it, rather than doing both in one apply.
    key_pair_name             = "storywriter-staging-ec2-tf" # EC2 login keypair
    route53_zone_id           = "Z0402623XN8X8KI30YSL"        # storywriter.net zone
    admin_email               = "web@almerindo.net"           # Let's Encrypt
-   allowed_ssh_cidrs         = ["0.0.0.0/0"]                  # prefer specific CIDRs
+   allowed_ssh_cidrs         = ["203.0.113.4/32"]             # your address; 0.0.0.0/0 is rejected
    github_actions_public_key = "ssh-ed25519 AAAA... heirloom-staging-deploy"
    ```
 
-3. **GitHub `staging` environment** needs two secrets for the deploy workflow:
+3. **GitHub `staging` environment** needs four secrets for the deploy workflow:
    - `SSH_PRIVATE_KEY` — private half of the deploy keypair (see step 1).
    - `STAGING_HOST` — the instance's public host, e.g.
      `heirloom-staging.storywriter.net` (or its Elastic IP).
+   - `AWS_DEPLOY_ROLE_ARN` — `terraform output github_deploy_role_arn`.
+   - `DEPLOY_SECURITY_GROUP_ID` — `terraform output security_group_id`.
 
-   CI does **not** run Terraform (see below), so no AWS/OIDC secret is required
-   by the workflow — infra is provisioned manually with the credentials you run
-   `terraform` with locally.
+   CI still does **not** run Terraform (see below). The last two exist only so a
+   deploy can let itself in through port 22, which is otherwise shut: the job
+   opens the port for its own runner address and revokes the rule again in a step
+   that runs even when the deploy fails. The role they name can do exactly that
+   and nothing else — two EC2 actions, on this one security group — and its trust
+   policy names this GitHub environment, so a workflow on another branch cannot
+   assume it without passing the environment's rules.
+
+   Two things worth knowing when this misbehaves:
+
+   - **Set both secrets before narrowing `allowed_ssh_cidrs`.** With either one
+     missing the job logs a warning, skips the open/close steps, and deploys the
+     old way — which works only while port 22 still admits the runner.
+   - **A `terraform apply` during a deploy will lock it out.** The rule is added
+     out of band and the security group uses inline `ingress` blocks, so an apply
+     removes it. That is what cleans up after a run that died before revoking,
+     but it also means the two should not overlap.
 
 ## Provisioning
 
