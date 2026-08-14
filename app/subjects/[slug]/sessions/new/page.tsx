@@ -79,7 +79,7 @@ export default function NewSessionPage() {
 
             router.push(`/subjects/${slug}/sessions/${session.id}`);
 
-        } catch (err) {
+        } catch {
             setError('Something went wrong. Please try again.');
         } finally {
             setLoading(false);

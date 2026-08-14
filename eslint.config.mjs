@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Infra, not app code (CloudFront Function runtime, not Node)
+    "terraform/**",
   ]),
 ]);
 
